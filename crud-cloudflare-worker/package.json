@@ -1,0 +1,12 @@
+{
+  "name": "crud-cloudflare-worker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "postgres": "^3.4.8"
+  }
+}
