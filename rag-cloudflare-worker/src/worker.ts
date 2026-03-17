@@ -76,7 +76,7 @@ const landingPage = `<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>📚 db9 RAG API <span class="badge">CHUNK_TEXT</span> <span class="tag">GIN FTS</span></h1>
+  <h1>📚 db9 RAG API <span class="badge">CHUNK_TEXT</span> <span class="tag">GIN FTS</span> <span class="tag">VECTOR</span></h1>
   
   <h2>Index URL</h2>
   <input type="text" id="url" placeholder="https://example.com/docs" />
@@ -98,12 +98,14 @@ POST /index
 POST /index
 {"path": "/docs/guide.md", "content": "# Guide..."}
 
-# Full-text search (GIN + tsvector)
+# Hybrid search (FTS + Vector with RRF)
 GET /search?q=postgres+agents
 
-# Search with tsquery operators
-GET /search?q=postgres%26agents  # AND
-GET /search?q=postgres|tikv      # OR
+# Vector-only search
+GET /search?q=postgres+agents&mode=vector
+
+# FTS-only search  
+GET /search?q=postgres+agents&mode=fts
 
 # List docs
 GET /docs</pre>
@@ -192,22 +194,30 @@ export default {
         const escapedContent = content.replace(/'/g, "''");
         const chunkResult = await sql.unsafe(`SELECT chunk_index, chunk_text FROM CHUNK_TEXT('${escapedContent}')`);
         
-        // Insert chunks with tsvector for FTS
+        // Insert chunks with tsvector + embedding
         let insertedCount = 0;
         for (const chunk of chunkResult) {
-          await sql`
-            INSERT INTO doc_chunks (doc_id, path, chunk_idx, content, tsv)
+          const chunkText = chunk.chunk_text?.trim();
+          if (!chunkText) continue; // Skip empty chunks
+          
+          const escapedText = chunkText.replace(/'/g, "''");
+          const escapedPath = path.replace(/'/g, "''");
+          
+          await sql.unsafe(`
+            INSERT INTO doc_chunks (doc_id, path, chunk_idx, content, tsv, embedding)
             VALUES (
               ${docId}, 
-              ${path}, 
+              '${escapedPath}', 
               ${chunk.chunk_index}, 
-              ${chunk.chunk_text},
-              to_tsvector('english', ${chunk.chunk_text})
+              '${escapedText}',
+              to_tsvector('english', '${escapedText}'),
+              embedding('${escapedText}')
             )
             ON CONFLICT (path, chunk_idx) DO UPDATE 
-            SET content = ${chunk.chunk_text},
-                tsv = to_tsvector('english', ${chunk.chunk_text})
-          `;
+            SET content = EXCLUDED.content,
+                tsv = EXCLUDED.tsv,
+                embedding = EXCLUDED.embedding
+          `);
           insertedCount++;
         }
         
@@ -222,42 +232,90 @@ export default {
         }, { headers: corsHeaders });
       }
       
-      // GET /search - Full-text search with GIN
+      // GET /search - Hybrid search (FTS + Vector)
       if (url.pathname === '/search' && request.method === 'GET') {
         const query = url.searchParams.get('q') || '';
         const limit = parseInt(url.searchParams.get('limit') || '10');
+        const mode = url.searchParams.get('mode') || 'hybrid'; // hybrid, fts, vector
         
-        // Convert query to tsquery format
-        // Replace spaces with & for AND, support | for OR
-        const tsQuery = query
-          .trim()
-          .split(/\s+/)
-          .filter(w => w.length > 0)
-          .join(' & ');
+        const escapedQuery = query.replace(/'/g, "''");
         
-        const escapedQuery = tsQuery.replace(/'/g, "''");
+        let results;
+        let searchType;
         
-        // Search using GIN index with ranking
-        const results = await sql.unsafe(`
-          SELECT 
-            path, 
-            chunk_idx,
-            ts_rank(tsv, to_tsquery('english', '${escapedQuery}')) as rank,
-            ts_headline('english', content, to_tsquery('english', '${escapedQuery}'), 
-                       'MaxFragments=2,MaxWords=30,StartSel=**,StopSel=**') as highlight
-          FROM doc_chunks
-          WHERE tsv @@ to_tsquery('english', '${escapedQuery}')
-          ORDER BY rank DESC
-          LIMIT ${limit}
-        `);
+        if (mode === 'vector') {
+          // Pure vector search
+          results = await sql.unsafe(`
+            SELECT 
+              path, 
+              chunk_idx,
+              1 - (embedding <=> embedding('${escapedQuery}')) as similarity,
+              left(content, 200) as preview
+            FROM doc_chunks
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> embedding('${escapedQuery}')
+            LIMIT ${limit}
+          `);
+          searchType = 'VECTOR';
+        } else if (mode === 'fts') {
+          // Pure FTS search
+          const tsQuery = query.trim().split(/\s+/).filter(w => w.length > 0).join(' & ');
+          results = await sql.unsafe(`
+            SELECT 
+              path, 
+              chunk_idx,
+              ts_rank(tsv, to_tsquery('english', '${tsQuery.replace(/'/g, "''")}')) as rank,
+              ts_headline('english', content, to_tsquery('english', '${tsQuery.replace(/'/g, "''")}'), 
+                         'MaxFragments=2,MaxWords=30,StartSel=**,StopSel=**') as highlight
+            FROM doc_chunks
+            WHERE tsv @@ to_tsquery('english', '${tsQuery.replace(/'/g, "''")}')
+            ORDER BY rank DESC
+            LIMIT ${limit}
+          `);
+          searchType = 'GIN_FTS';
+        } else {
+          // Hybrid: RRF (Reciprocal Rank Fusion)
+          const tsQuery = query.trim().split(/\s+/).filter(w => w.length > 0).join(' & ');
+          results = await sql.unsafe(`
+            WITH fts AS (
+              SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank(tsv, to_tsquery('english', '${tsQuery.replace(/'/g, "''")}')) DESC) as fts_rank
+              FROM doc_chunks
+              WHERE tsv @@ to_tsquery('english', '${tsQuery.replace(/'/g, "''")}')
+              LIMIT 50
+            ),
+            vec AS (
+              SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> embedding('${escapedQuery}')) as vec_rank
+              FROM doc_chunks
+              WHERE embedding IS NOT NULL
+              LIMIT 50
+            ),
+            combined AS (
+              SELECT 
+                COALESCE(fts.id, vec.id) as id,
+                COALESCE(1.0 / (60 + fts.fts_rank), 0) + COALESCE(1.0 / (60 + vec.vec_rank), 0) as rrf_score
+              FROM fts
+              FULL OUTER JOIN vec ON fts.id = vec.id
+            )
+            SELECT 
+              c.path,
+              c.chunk_idx,
+              combined.rrf_score as score,
+              ts_headline('english', c.content, to_tsquery('english', '${tsQuery.replace(/'/g, "''")}'), 
+                         'MaxFragments=2,MaxWords=30,StartSel=**,StopSel=**') as highlight
+            FROM combined
+            JOIN doc_chunks c ON c.id = combined.id
+            ORDER BY combined.rrf_score DESC
+            LIMIT ${limit}
+          `);
+          searchType = 'HYBRID_RRF';
+        }
         
         await sql.end();
         
         return Response.json({ 
           query, 
-          tsquery: tsQuery,
           results,
-          search_type: 'GIN_FTS'
+          search_type: searchType
         }, { headers: corsHeaders });
       }
       
