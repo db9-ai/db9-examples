@@ -1,8 +1,14 @@
 /**
  * db9-rag-worker - Document indexing and search API
  * 
+ * Features:
+ * - Smart chunking with CHUNK_TEXT
+ * - GIN full-text search with tsvector
+ * - Auto embedding ready (when EMBED_TEXT available)
+ * 
+ * Endpoints:
  * POST /index   - Index URL or markdown content
- * GET  /search  - Search indexed documents
+ * GET  /search  - Full-text search
  * GET  /docs    - List indexed documents
  */
 
@@ -11,6 +17,7 @@ import postgres from 'postgres';
 interface Env {
   DB9_API_TOKEN: string;
   DB9_DATABASE: string;
+  DB9_API_URL?: string;
 }
 
 interface ConnectTokenResponse {
@@ -28,7 +35,8 @@ const corsHeaders = {
 };
 
 async function getConnection(env: Env) {
-  const res = await fetch(`https://api.staging.db9.ai/customer/databases/${env.DB9_DATABASE}/connect-token`, {
+  const apiUrl = env.DB9_API_URL || 'https://api.staging.db9.ai';
+  const res = await fetch(`${apiUrl}/customer/databases/${env.DB9_DATABASE}/connect-token`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${env.DB9_API_TOKEN}`, 'Content-Type': 'application/json' },
     body: '{}',
@@ -63,18 +71,19 @@ const landingPage = `<!DOCTYPE html>
     input { background: #161b22; color: #c9d1d9; width: 300px; }
     button { background: #238636; color: white; cursor: pointer; border: none; }
     button:hover { background: #2ea043; }
-    #result { margin-top: 20px; padding: 15px; background: #161b22; border-radius: 6px; white-space: pre-wrap; }
+    #result { margin-top: 20px; padding: 15px; background: #161b22; border-radius: 6px; white-space: pre-wrap; max-height: 400px; overflow-y: auto; }
+    .tag { background: #388bfd26; color: #58a6ff; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-left: 5px; }
   </style>
 </head>
 <body>
-  <h1>📚 db9 RAG API <span class="badge">CHUNK_TEXT</span></h1>
+  <h1>📚 db9 RAG API <span class="badge">CHUNK_TEXT</span> <span class="tag">GIN FTS</span></h1>
   
   <h2>Index URL</h2>
   <input type="text" id="url" placeholder="https://example.com/docs" />
   <button onclick="indexUrl()">Index</button>
   
-  <h2>Search</h2>
-  <input type="text" id="query" placeholder="search query" />
+  <h2>Full-Text Search</h2>
+  <input type="text" id="query" placeholder="search query (supports AND/OR)" />
   <button onclick="search()">Search</button>
   
   <div id="result"></div>
@@ -85,12 +94,16 @@ const landingPage = `<!DOCTYPE html>
 POST /index
 {"url": "https://example.com/page"}
 
-# Index markdown content
+# Index markdown content  
 POST /index
 {"path": "/docs/guide.md", "content": "# Guide..."}
 
-# Search
-GET /search?q=keyword
+# Full-text search (GIN + tsvector)
+GET /search?q=postgres+agents
+
+# Search with tsquery operators
+GET /search?q=postgres%26agents  # AND
+GET /search?q=postgres|tikv      # OR
 
 # List docs
 GET /docs</pre>
@@ -98,6 +111,7 @@ GET /docs</pre>
   <script>
     async function indexUrl() {
       const url = document.getElementById('url').value;
+      document.getElementById('result').textContent = 'Indexing...';
       const res = await fetch('/index', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -163,9 +177,6 @@ export default {
           `;
         }
         
-        // Delete old chunks
-        await sql`DELETE FROM doc_chunks WHERE path = ${path}`;
-        
         // Get doc_id
         const docResult = await sql`SELECT id FROM docs WHERE path = ${path}`;
         const docId = docResult[0]?.id;
@@ -174,49 +185,80 @@ export default {
           throw new Error('Failed to get doc_id');
         }
         
-        // Chunk first, then insert (workaround for parameter issue)
-        // Use unsafe to avoid parameter type issues with table functions
+        // Delete old chunks
+        await sql`DELETE FROM doc_chunks WHERE path = ${path}`;
+        
+        // Chunk content
         const escapedContent = content.replace(/'/g, "''");
         const chunkResult = await sql.unsafe(`SELECT chunk_index, chunk_text FROM CHUNK_TEXT('${escapedContent}')`);
         
+        // Insert chunks with tsvector for FTS
         let insertedCount = 0;
         for (const chunk of chunkResult) {
           await sql`
-            INSERT INTO doc_chunks (doc_id, path, chunk_idx, content)
-            VALUES (${docId}, ${path}, ${chunk.chunk_index}, ${chunk.chunk_text})
-            ON CONFLICT (path, chunk_idx) DO UPDATE SET content = ${chunk.chunk_text}
+            INSERT INTO doc_chunks (doc_id, path, chunk_idx, content, tsv)
+            VALUES (
+              ${docId}, 
+              ${path}, 
+              ${chunk.chunk_index}, 
+              ${chunk.chunk_text},
+              to_tsvector('english', ${chunk.chunk_text})
+            )
+            ON CONFLICT (path, chunk_idx) DO UPDATE 
+            SET content = ${chunk.chunk_text},
+                tsv = to_tsvector('english', ${chunk.chunk_text})
           `;
           insertedCount++;
         }
-        
-        const chunks = { length: insertedCount };
         
         await sql.end();
         
         return Response.json({
           success: true,
           path,
-          chunks: chunks.length,
+          chunks: insertedCount,
           source: sourceUrl,
+          features: ['CHUNK_TEXT', 'GIN_FTS'],
         }, { headers: corsHeaders });
       }
       
-      // GET /search - Search documents
+      // GET /search - Full-text search with GIN
       if (url.pathname === '/search' && request.method === 'GET') {
         const query = url.searchParams.get('q') || '';
         const limit = parseInt(url.searchParams.get('limit') || '10');
         
-        const results = await sql`
-          SELECT path, chunk_idx, 
-                 substring(content, 1, 300) as preview
-          FROM doc_chunks 
-          WHERE content ILIKE ${'%' + query + '%'}
+        // Convert query to tsquery format
+        // Replace spaces with & for AND, support | for OR
+        const tsQuery = query
+          .trim()
+          .split(/\s+/)
+          .filter(w => w.length > 0)
+          .join(' & ');
+        
+        const escapedQuery = tsQuery.replace(/'/g, "''");
+        
+        // Search using GIN index with ranking
+        const results = await sql.unsafe(`
+          SELECT 
+            path, 
+            chunk_idx,
+            ts_rank(tsv, to_tsquery('english', '${escapedQuery}')) as rank,
+            ts_headline('english', content, to_tsquery('english', '${escapedQuery}'), 
+                       'MaxFragments=2,MaxWords=30,StartSel=**,StopSel=**') as highlight
+          FROM doc_chunks
+          WHERE tsv @@ to_tsquery('english', '${escapedQuery}')
+          ORDER BY rank DESC
           LIMIT ${limit}
-        `;
+        `);
         
         await sql.end();
         
-        return Response.json({ query, results }, { headers: corsHeaders });
+        return Response.json({ 
+          query, 
+          tsquery: tsQuery,
+          results,
+          search_type: 'GIN_FTS'
+        }, { headers: corsHeaders });
       }
       
       // GET /docs - List indexed documents

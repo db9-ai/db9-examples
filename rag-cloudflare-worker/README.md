@@ -1,6 +1,6 @@
 # RAG Cloudflare Worker
 
-Document indexing and search API using db9's `CHUNK_TEXT` function.
+Document indexing and search API using db9's `CHUNK_TEXT` + GIN full-text search.
 
 ## Live Demo
 
@@ -8,10 +8,10 @@ https://db9-rag.db9.workers.dev
 
 ## Features
 
-- Index URLs (via r.jina.ai markdown conversion)
-- Index markdown content directly
-- Smart chunking with QMD algorithm
-- Full-text search
+- **Smart chunking** with `CHUNK_TEXT` (QMD algorithm)
+- **GIN full-text search** with `tsvector` + `ts_rank`
+- **Highlighted results** with `ts_headline`
+- **Auto embedding ready** (when `EMBED_TEXT` available)
 
 ## API
 
@@ -23,24 +23,31 @@ curl -X POST -H "Content-Type: application/json" \
   https://db9-rag.db9.workers.dev/index
 ```
 
-### Index content
+### Full-Text Search (GIN)
 
 ```bash
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"path":"/docs/guide.md","content":"# Guide\n\nContent..."}' \
-  https://db9-rag.db9.workers.dev/index
+# Simple search (words joined with AND)
+curl "https://db9-rag.db9.workers.dev/search?q=postgres+agents"
+
+# OR search
+curl "https://db9-rag.db9.workers.dev/search?q=postgres|tikv"
 ```
 
-### Search
-
-```bash
-curl "https://db9-rag.db9.workers.dev/search?q=keyword"
-```
-
-### List documents
-
-```bash
-curl "https://db9-rag.db9.workers.dev/docs"
+Response includes ranking and highlighted snippets:
+```json
+{
+  "query": "postgres agents",
+  "tsquery": "postgres & agents",
+  "search_type": "GIN_FTS",
+  "results": [
+    {
+      "path": "/web/db9.ai",
+      "chunk_idx": 0,
+      "rank": 0.094,
+      "highlight": "db9 — **Postgres** but for **agents**..."
+    }
+  ]
+}
 ```
 
 ## Schema
@@ -60,39 +67,38 @@ CREATE TABLE doc_chunks (
   path TEXT NOT NULL,
   chunk_idx INT NOT NULL,
   content TEXT NOT NULL,
-  embedding vector(1024),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
+  tsv tsvector,                    -- GIN full-text search
+  embedding vector(1024),          -- Vector search (future)
   UNIQUE(path, chunk_idx)
 );
+
+-- GIN index for full-text search
+CREATE INDEX idx_chunks_tsv ON doc_chunks USING GIN(tsv);
+
+-- HNSW index for vector search (future)
+CREATE INDEX idx_chunks_embedding ON doc_chunks 
+  USING hnsw (embedding vector_cosine_ops);
+```
+
+## How It Works
+
+```
+Input URL/Content
+      ↓
+CHUNK_TEXT() → Smart chunking (900 tokens, 15% overlap)
+      ↓
+to_tsvector() → Index for GIN search
+      ↓
+EMBED_TEXT() → Vector embedding (when available)
 ```
 
 ## Deploy
 
-1. Set secrets:
 ```bash
+# Set secrets
 wrangler secret put DB9_API_TOKEN
-```
 
-2. Update `wrangler.toml` with your database ID
-
-3. Deploy:
-```bash
+# Update wrangler.toml with your database
+# Deploy
 wrangler deploy
-```
-
-## Vector Search (when EMBED_TEXT is available)
-
-```sql
--- Index with embeddings
-INSERT INTO doc_chunks (path, chunk_idx, content, embedding)
-SELECT '/docs/guide.md', c.chunk_index, c.chunk_text,
-       EMBED_TEXT('titan-v2', c.chunk_text)
-FROM CHUNK_TEXT(fs9_read('/docs/guide.md')) c;
-
--- Vector search
-SELECT path, content,
-       1 - (embedding <=> EMBED_TEXT('titan-v2', 'query')) AS score
-FROM doc_chunks
-ORDER BY embedding <=> EMBED_TEXT('titan-v2', 'query')
-LIMIT 10;
 ```
