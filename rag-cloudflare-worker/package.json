@@ -1,0 +1,10 @@
+{
+  "name": "db9-rag-worker",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "postgres": "^3.4.8"
+  }
+}
