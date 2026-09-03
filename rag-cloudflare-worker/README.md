@@ -75,9 +75,18 @@ CREATE TABLE doc_chunks (
 -- GIN index for full-text search
 CREATE INDEX idx_chunks_tsv ON doc_chunks USING GIN(tsv);
 
--- HNSW index for vector search (future)
-CREATE INDEX idx_chunks_embedding ON doc_chunks 
-  USING hnsw (embedding vector_cosine_ops);
+-- HNSW index for vector search — NOT YET AVAILABLE.
+-- HNSW index building is gated off server-side in the current release, and the
+-- two transports fail differently:
+--   pgwire (this worker's path) -> ERROR 55000:
+--     feature "hnsw_index" is unavailable (DisabledByConfiguration)
+--   HTTP SQL API (db9 db sql)   -> reports CREATE INDEX and the index appears
+--     in pg_indexes, but the planner never uses it. The success is cosmetic.
+-- Leave it commented out either way: vector search still works without it,
+-- using an exact sequential scan.
+--
+-- CREATE INDEX idx_chunks_embedding ON doc_chunks
+--   USING hnsw (embedding vector_cosine_ops);
 ```
 
 ## How It Works
