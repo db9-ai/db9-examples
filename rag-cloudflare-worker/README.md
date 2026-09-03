@@ -77,8 +77,11 @@ CREATE INDEX idx_chunks_tsv ON doc_chunks USING GIN(tsv);
 
 -- HNSW index for vector search — NOT YET AVAILABLE.
 -- HNSW index building is gated off server-side in the current release, so the
--- statement below fails with XX000 (internal error). Leave it commented out:
--- vector search still works without it, using an exact sequential scan.
+-- statement below cannot succeed. On this table it fails with a bare
+-- XX000 (internal error) on both the wire protocol and the HTTP SQL API,
+-- because HNSW also requires a single-column PRIMARY KEY and this table has
+-- only a UNIQUE constraint. Leave it commented out: vector search still works
+-- without it, using an exact sequential scan.
 --
 -- CREATE INDEX idx_chunks_embedding ON doc_chunks
 --   USING hnsw (embedding vector_cosine_ops);
