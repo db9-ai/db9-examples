@@ -11,7 +11,7 @@ https://db9-rag.db9.workers.dev
 - **Smart chunking** with `CHUNK_TEXT` (QMD algorithm)
 - **GIN full-text search** with `tsvector` + `ts_rank`
 - **Highlighted results** with `ts_headline`
-- **Auto embedding** with `embedding()` — but see the caveat under Schema: the per-statement embedding call cap means the worker's vector queries fail above ~100 chunks
+- **Auto embedding** with `embedding()` — but see the caveat under Schema: the per-statement embedding call cap means both the default hybrid search and `mode=vector` fail above ~100 indexed chunks
 
 ## API
 
@@ -79,7 +79,8 @@ CREATE TABLE doc_chunks (
 CREATE INDEX idx_chunks_tsv ON doc_chunks USING GIN(tsv);
 
 -- HNSW index for vector search. Creation works on both pgwire and the HTTP
--- SQL API (it was gated off server-side until db9-server c027f4f8).
+-- SQL API (it was gated off server-side before db9-server #4167; verified on
+-- build c027f4f8).
 --
 -- The planner only uses it when ALL of these hold, which is strict enough that
 -- the worker's current queries do NOT qualify:
@@ -91,8 +92,11 @@ CREATE INDEX idx_chunks_tsv ON doc_chunks USING GIN(tsv);
 --   Adaptive Vector Top-K using idx_chunks_embedding ... HNSW Scan ...
 -- (the HTTP SQL API returns no EXPLAIN rows, so check plans over pgwire).
 --
--- VEC_EMBED_COSINE_DISTANCE(embedding, 'query text') resolves the probe before
--- planning and does use the index. See https://db9.ai/docs/extensions/vector/.
+-- VEC_EMBED_COSINE_DISTANCE(embedding, 'query text') supplies a constant probe,
+-- so it satisfies the first condition and also avoids the per-row embedding()
+-- call cap — but the LIMIT and no-WHERE conditions still apply, so it is not on
+-- its own enough to get an indexed scan.
+-- See https://db9.ai/docs/extensions/vector/.
 CREATE INDEX idx_chunks_embedding ON doc_chunks
   USING hnsw (embedding vector_cosine_ops);
 ```
