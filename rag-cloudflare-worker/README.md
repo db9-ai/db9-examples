@@ -25,19 +25,22 @@ curl -X POST -H "Content-Type: application/json" \
 
 ### Full-Text Search (GIN)
 
+`mode=fts` is explicit here: without it `/search` runs the default **hybrid** mode, which
+returns a different shape (`score`, `HYBRID_RRF`) and hits the embedding call cap above ~100
+indexed chunks.
+
 ```bash
 # Simple search (words joined with AND)
-curl "https://db9-rag.db9.workers.dev/search?q=postgres+agents"
+curl "https://db9-rag.db9.workers.dev/search?q=postgres+agents&mode=fts"
 
 # OR search
-curl "https://db9-rag.db9.workers.dev/search?q=postgres|tikv"
+curl "https://db9-rag.db9.workers.dev/search?q=postgres|tikv&mode=fts"
 ```
 
 Response includes ranking and highlighted snippets:
 ```json
 {
   "query": "postgres agents",
-  "tsquery": "postgres & agents",
   "search_type": "GIN_FTS",
   "results": [
     {
@@ -93,8 +96,8 @@ CREATE INDEX idx_chunks_tsv ON doc_chunks USING GIN(tsv);
 -- (the HTTP SQL API returns no EXPLAIN rows, so check plans over pgwire).
 --
 -- VEC_EMBED_COSINE_DISTANCE(embedding, 'query text') supplies a constant probe,
--- so it satisfies the first condition and also avoids the per-row embedding()
--- call cap — but the LIMIT and no-WHERE conditions still apply, so it is not on
+-- so it satisfies the first condition and also avoids the per-statement
+-- embedding() call cap — but the LIMIT and no-WHERE conditions still apply, so it is not on
 -- its own enough to get an indexed scan.
 -- See https://db9.ai/docs/extensions/vector/.
 CREATE INDEX idx_chunks_embedding ON doc_chunks
