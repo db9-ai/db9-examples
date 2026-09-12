@@ -68,25 +68,21 @@ CREATE TABLE doc_chunks (
   chunk_idx INT NOT NULL,
   content TEXT NOT NULL,
   tsv tsvector,                    -- GIN full-text search
-  embedding vector(1024),          -- Vector search (future)
+  embedding vector(1024),          -- Vector search
   UNIQUE(path, chunk_idx)
 );
 
 -- GIN index for full-text search
 CREATE INDEX idx_chunks_tsv ON doc_chunks USING GIN(tsv);
 
--- HNSW index for vector search — NOT YET AVAILABLE.
--- HNSW index building is gated off server-side in the current release, and the
--- two transports fail differently:
---   pgwire (this worker's path) -> ERROR 55000:
---     feature "hnsw_index" is unavailable (DisabledByConfiguration)
---   HTTP SQL API (db9 db sql)   -> reports CREATE INDEX and the index appears
---     in pg_indexes, but the planner never uses it. The success is cosmetic.
--- Leave it commented out either way: vector search still works without it,
--- using an exact sequential scan.
---
--- CREATE INDEX idx_chunks_embedding ON doc_chunks
---   USING hnsw (embedding vector_cosine_ops);
+-- HNSW index for vector search — available since the 2026-09-04 release.
+-- Creation now succeeds on both pgwire and the HTTP SQL API, and the planner
+-- uses it: EXPLAIN reports "HNSW Scan using idx_chunks_embedding".
+-- Note the index is only used when the probe vector is an inlined literal; a
+-- driver-bound parameter falls back to a sequential scan. See
+-- https://db9.ai/docs/extensions/vector/ for the details.
+CREATE INDEX idx_chunks_embedding ON doc_chunks
+  USING hnsw (embedding vector_cosine_ops);
 ```
 
 ## How It Works
